@@ -856,6 +856,45 @@
             <label for="AUTO_BUY_UPLOAD_CHECK_INTERVAL_HOURS" class="small">Check Interval (hours)</label>
           </div>
 
+          <div class="card mb-3 border-secondary-subtle toggle-card" id="watches-card">
+            <div
+              class="card-header border-bottom-0 bg-transparent d-flex justify-content-between align-items-center py-2 cursor-pointer noselect"
+              onclick="toggleCardSwitch('WATCHES_ENABLED')">
+              <span class="small fw-bold d-flex align-items-center"><i class="bi bi-binoculars me-2"></i> Watches
+                (Release Tracking)</span>
+              <div class="form-check form-switch m-0">
+                <input class="form-check-input" type="checkbox" id="WATCHES_ENABLED" name="WATCHES_ENABLED" {% if
+                  WATCHES_ENABLED %}checked{% endif %} data-collapse-target="#collapse-watches">
+              </div>
+            </div>
+            <div id="collapse-watches" class="collapse {% if WATCHES_ENABLED %}show{% endif %}">
+              <div class="card-body border-top pt-2 pb-2">
+                <div class="form-text small mb-2">
+                  Runs your saved watches (saved searches with a title filter) on a schedule and sends new matches
+                  straight to the torrent client. Each watch has its own interval; this tick only decides how often
+                  MouseSearch checks whether any watch is due. Manage watches from the
+                  <i class="bi bi-binoculars"></i> Watches panel.
+                </div>
+                <div class="row g-2">
+                  <div class="col-6">
+                    <div class="form-floating">
+                      <input type="number" class="form-control" id="WATCHES_TICK_MINUTES" name="WATCHES_TICK_MINUTES"
+                        min="1" value="{{ WATCHES_TICK_MINUTES }}" placeholder="Tick Interval (minutes)">
+                      <label for="WATCHES_TICK_MINUTES" class="small">Tick Interval (minutes)</label>
+                    </div>
+                  </div>
+                  <div class="col-6">
+                    <div class="form-floating">
+                      <input type="number" class="form-control" id="WATCHES_PAUSE_SECONDS" name="WATCHES_PAUSE_SECONDS"
+                        min="0" value="{{ WATCHES_PAUSE_SECONDS }}" placeholder="Pause Between Watches (seconds)">
+                      <label for="WATCHES_PAUSE_SECONDS" class="small">Pause Between Watches (s)</label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
         </div>
       </div>
 

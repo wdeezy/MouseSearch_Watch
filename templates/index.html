@@ -143,6 +143,11 @@
         </form>
       </div>
 
+      <button class="btn btn-outline-secondary p-2 rounded me-2" type="button" data-bs-toggle="offcanvas"
+        data-bs-target="#watchesOffcanvas" aria-controls="watchesOffcanvas" title="Watches" aria-label="Watches">
+        <i class="bi bi-binoculars"></i>
+      </button>
+
       <button class="navbar-toggler p-2 rounded" type="button" data-bs-toggle="offcanvas"
         data-bs-target="#settingsOffcanvas">
         <span class="navbar-toggler-icon"></span>
@@ -221,6 +226,11 @@
               data-bs-target="#advancedSearchOffcanvas" aria-controls="advancedSearchOffcanvas">
               <i class="bi bi-sliders me-2"></i>Filters & Advanced
               <span class="badge bg-secondary ms-1 rounded-pill" id="filter-count" style="display:none;">0</span>
+            </button>
+            <button class="btn btn-outline-secondary" type="button" data-bs-toggle="offcanvas"
+              data-bs-target="#watchesOffcanvas" aria-controls="watchesOffcanvas">
+              <i class="bi bi-binoculars me-2"></i>Watches
+              <span class="badge bg-secondary ms-1 rounded-pill" id="watches-count-badge" style="display:none;">0</span>
             </button>
           </div>
         </form>
@@ -508,6 +518,7 @@
   {% include 'modals/wedge_purchase.html' %}
   {% include 'modals/download_confirm.html' %}
   {% include 'modals/settings_offcanvas.html' %}
+  {% include 'modals/watches_offcanvas.html' %}
   {% include 'modals/insufficient_buffer.html' %}
   {% include 'modals/book_details.html' %}
 
@@ -518,6 +529,7 @@
     window.resultsSortMode = {{ RESULTS_SORT_MODE | tojson }};
   </script>
   <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/watches.js') }}"></script>
 
 
   <div id="toast-container" aria-live="polite" aria-atomic="true" class="position-fixed bottom-0 end-0 p-3"

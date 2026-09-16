@@ -537,6 +537,74 @@ This setup guarantees that both paths point to the same underlying device, allow
 
 ---
 
+## Watches (Release Tracking + Auto-Grab)
+
+A **watch** is a saved search plus a title filter. On a schedule, MouseSearch re-runs the search against MAM,
+keeps the results whose title matches the watch's regex, drops anything it has already grabbed (or that your
+account has already snatched), and sends the rest to your torrent client through the exact same path the
+download button uses. Auto-organization, the completion hook and anything downstream are untouched: the watch
+only gets the torrent into the client.
+
+Typical use: weekly magazines and newspapers ("The Economist US Edition", "New Scientist"), ongoing series, or
+any author whose new releases you never want to miss.
+
+### Enabling the scheduler
+
+Settings &rarr; **Helpers** &rarr; **Watches (Release Tracking)**:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `WATCHES_ENABLED` | off | Registers the scheduler tick. Watches can always be tested and run by hand, even when this is off. |
+| `WATCHES_TICK_MINUTES` | 5 | How often MouseSearch checks whether any watch is due. |
+| `WATCHES_PAUSE_SECONDS` | 5 | Pause between two watches that run on the same tick, so MAM sees spaced requests. |
+
+Each watch has its own interval (default 60 minutes, minimum 10). MAM asks that automated searches stay well
+spaced across your whole account, so keep per-watch intervals in the tens of minutes, not single digits.
+
+### Creating a watch
+
+1. Run a normal search and confirm it finds what you expect.
+2. Open **Filters & Advanced** and click **Save Current Search As Watch**. The query, search fields, languages,
+   categories, flags and seeders filter are copied over and a `^query` title regex is pre-filled.
+3. Adjust the **title filter** regex (case-insensitive, `re.search` semantics), the interval, the client category
+   and the **max grabs per run** cap, then **Save**.
+4. Click **Test**. The result panel lists every search result with three columns: *matched?*, *seen?* and
+   *would grab?*, so you can see exactly why each row would or would not be grabbed. Nothing is downloaded.
+5. If the current back-catalog is already on disk, click **Mark all current as seen** so the first live run does
+   not grab it. Then **Run now** should report 0 grabs.
+
+From then on the scheduler handles it. Every decision is logged per watch (**History**): `checked`, `matched`,
+`grabbed`, `skipped_seen`, `skipped_cap` and `error`. A grab that fails (client down, insufficient buffer) is
+logged as an error and is **not** marked seen, so it is retried on the next run. The per-run cap protects a
+private tracker ratio from a loose regex; overflow is logged as `skipped_cap` and picked up on later runs,
+newest first.
+
+Each grab also fires the `watch_grabbed` auto-task webhook event (see *Auto-Task Webhook Templates*) and a toast
+for anyone with the UI open.
+
+### API
+
+Everything the panel does is available under `/api/watches`:
+
+```
+GET    /api/watches                 list
+POST   /api/watches                 create (400 with the error text if the regex does not compile)
+GET    /api/watches/<id>
+PUT    /api/watches/<id>            update (partial bodies are fine)
+DELETE /api/watches/<id>
+POST   /api/watches/<id>/test       dry run: search + filter, nothing grabbed or recorded
+POST   /api/watches/<id>/run        real run
+GET    /api/watches/<id>/events     history (?limit=50)
+GET    /api/watches/<id>/seen       dedupe table
+POST   /api/watches/<id>/seen       {"items": [{"id": "...", "title": "..."}]} mark seen without grabbing
+DELETE /api/watches/<id>/seen       forget seen items ({"id": "..."} for a single one)
+POST   /api/watches/test            dry run an unsaved definition
+GET    /api/watches/status          scheduler state
+```
+
+Watches, their history and the dedupe table live in `watches.db` (sqlite) under `DATA_PATH`, next to
+`config.json` and `database.json`.
+
 ## Feature Roadmap
 
 Planned features and enhancements for future releases:

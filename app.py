@@ -44,6 +44,8 @@ from clients import get_torrent_client, get_client_display_name, get_available_c
 from hashing import calculate_torrent_hash_from_url, calculate_torrent_hash_from_bytes
 from hardcover.client import HardcoverAPIError, HardcoverClient
 from hardcover.resolver import HardcoverBatchRunner, HardcoverEnrichmentConfig, HardcoverResolver
+from watches import store as watch_store, runner as watch_runner
+from watches.routes import watches_bp
 
 # --- SCHEDULER AND STATE SETUP ---
 app = Quart(__name__)
@@ -697,6 +699,39 @@ def get_organized_destination_root(torrent_meta: dict, config: dict | None = Non
     return default_root or FALLBACK_CONFIG["ORGANIZED_PATH"]
 
 
+def sync_watches_scheduler_job(*, initial_delay_seconds: int | None = None):
+    """Register or remove the watches tick job so it matches the current config."""
+    if app.config.get("WATCHES_ENABLED"):
+        try:
+            tick_minutes = int(app.config.get("WATCHES_TICK_MINUTES", FALLBACK_CONFIG["WATCHES_TICK_MINUTES"]) or 0)
+        except (TypeError, ValueError):
+            tick_minutes = FALLBACK_CONFIG["WATCHES_TICK_MINUTES"]
+        tick_minutes = max(1, tick_minutes)
+        scheduler.add_job(
+            watch_runner.run_all_watches,
+            'interval',
+            minutes=tick_minutes,
+            id='watches_tick_job',
+            replace_existing=True,
+            misfire_grace_time=120,
+        )
+        if initial_delay_seconds is not None:
+            scheduler.add_job(
+                watch_runner.run_all_watches,
+                'date',
+                run_date=datetime.now() + timedelta(seconds=initial_delay_seconds),
+                id='initial_watches_tick_job',
+                replace_existing=True,
+            )
+        app.logger.info(f"Watches tick scheduled every {tick_minutes} min.")
+    else:
+        for job_id in ('watches_tick_job', 'initial_watches_tick_job'):
+            try:
+                scheduler.remove_job(job_id)
+            except Exception:
+                pass
+
+
 @app.before_serving
 async def startup():
     # 1. Load the configuration FIRST
@@ -777,7 +812,9 @@ async def startup():
         )
         scheduler.add_job(auto_buy_vip, 'date', run_date=datetime.now() + timedelta(seconds=10), id='initial_vip_buy_job')
         app.logger.info("AUTO_BUY_VIP started")
-    
+
+    sync_watches_scheduler_job(initial_delay_seconds=30)
+
     if not scheduler.running:
         scheduler.start()
         app.logger.debug("AsyncIOScheduler started")
@@ -824,7 +861,8 @@ async def shutdown():
         app.logger.info("Shared MAM proxy AsyncClient closed")
 
     await close_autosuggest_cache_db()
-    
+    watch_store.close()
+
     global monitor_task
     if monitor_task:
         monitor_task.cancel()
@@ -1047,6 +1085,9 @@ FALLBACK_CONFIG = {
     "THUMBNAIL_CACHE_MAX_SIZE_MB": 500,
     "MAX_SEARCH_RESULTS": 50,
     "MAX_AUTOCOMPLETE_RESULTS": 20,
+    "WATCHES_ENABLED": False,
+    "WATCHES_TICK_MINUTES": 5,
+    "WATCHES_PAUSE_SECONDS": 5,
     "HARDCOVER_ENRICHMENT_ENABLED": True,
     "HARDCOVER_API_TOKEN": "",
     "HARDCOVER_API_URL": "https://api.hardcover.app/v1/graphql",
@@ -1077,6 +1118,9 @@ VALID_VIP_DURATIONS = {"4", "8", "12", "max"}
 CONFIG_FILE = DATA_PATH / "config.json"
 DATABASE_FILE = DATA_PATH / "database.json"
 IP_STATE_FILE = DATA_PATH / "ip_state.json"
+WATCHES_DB_PATH = DATA_PATH / "watches.db"
+watch_store.configure(WATCHES_DB_PATH)
+app.register_blueprint(watches_bp)
 ENV_FILE = Path(".env")
 
 
@@ -1973,6 +2017,7 @@ def _normalize_webhook_query_value(value):
 def _build_auto_task_summary(context):
     label_map = {
         "task": "Task",
+        "watch": "Watch",
         "reason": "Reason",
         "amount": "Amount",
         "purchase_size": "Purchase Size",
@@ -1997,6 +2042,7 @@ def _build_auto_task_summary(context):
     }
     ordered_keys = [
         "task",
+        "watch",
         "reason",
         "amount",
         "purchase_size",
@@ -6016,6 +6062,7 @@ async def update_settings():
         "BLOCK_DOWNLOAD_ON_LOW_BUFFER",
         "AUTO_BUY_PERSONAL_FL_ON_DOWNLOAD",
         "AUTO_BUY_PERSONAL_FL_ON_DOWNLOAD_MIN_SIZE_ENABLED",
+        "WATCHES_ENABLED",
     }
     for key in FALLBACK_CONFIG.keys():
         if key in boolean_fields: config_to_update[key] = key in form
@@ -6159,6 +6206,8 @@ async def update_settings():
             app.logger.info("Auto-organize safety net disabled.")
         except:
             pass
+
+    sync_watches_scheduler_job()
 
     # Get the new display name from the source of truth
     new_type = config_to_update.get("TORRENT_CLIENT_TYPE")
@@ -6565,6 +6614,19 @@ async def check_for_unorganized_torrents():
                 failed_count=failed,
                 error=last_error,
             )
+
+
+# --- Watches: hand the shared search/add helpers to the runner ---
+watch_runner.configure(
+    build_params=build_mam_search_params,
+    search=run_mam_search,
+    add=add_torrent_from_result,
+    login=login_mam,
+    notify=send_auto_task_webhook_notification,
+    toast=broadcast_toast,
+    logger=app.logger,
+    config=lambda key, default=None: app.config.get(key, default),
+)
 
 
 if __name__ == "__main__":
