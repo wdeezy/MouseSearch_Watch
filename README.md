@@ -356,6 +356,7 @@ If `AUTO_TASK_WEBHOOK_URL` is set, MouseSearch sends webhook notifications for:
 * `auto_update_ip`
 * `auto_organize_on_download`
 * `auto_organize_on_schedule`
+* `watch_grabbed` (a watch sent a new release to the torrent client; includes `{watch}`, `{title}` and `{mid}`)
 
 Set `AUTO_TASK_WEBHOOK_EVENTS` if you only want a subset of those events.
 
@@ -370,7 +371,7 @@ Example `POST` webhook:
 
 ```env
 AUTO_TASK_WEBHOOK_URL=https://hooks.example.com/mousesearch
-AUTO_TASK_WEBHOOK_EVENTS=["auto_buy_vip","auto_buy_upload_ratio","auto_buy_upload_buffer","auto_buy_upload_bonus","auto_update_ip","auto_organize_on_download","auto_organize_on_schedule"]
+AUTO_TASK_WEBHOOK_EVENTS=["auto_buy_vip","auto_buy_upload_ratio","auto_buy_upload_buffer","auto_buy_upload_bonus","auto_update_ip","auto_organize_on_download","auto_organize_on_schedule","watch_grabbed"]
 AUTO_TASK_WEBHOOK_METHOD=POST
 AUTO_TASK_WEBHOOK_PARAMS={"source":"mousesearch","event":"{event}","status":"{status}"}
 AUTO_TASK_WEBHOOK_BODY={"status":"{status}","summary":"{summary}"}
