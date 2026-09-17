@@ -44,6 +44,8 @@ from clients import get_torrent_client, get_client_display_name, get_available_c
 from hashing import calculate_torrent_hash_from_url, calculate_torrent_hash_from_bytes
 from hardcover.client import HardcoverAPIError, HardcoverClient
 from hardcover.resolver import HardcoverBatchRunner, HardcoverEnrichmentConfig, HardcoverResolver
+from watches import store as watch_store, runner as watch_runner
+from watches.routes import watches_bp
 
 # --- SCHEDULER AND STATE SETUP ---
 app = Quart(__name__)
@@ -697,6 +699,39 @@ def get_organized_destination_root(torrent_meta: dict, config: dict | None = Non
     return default_root or FALLBACK_CONFIG["ORGANIZED_PATH"]
 
 
+def sync_watches_scheduler_job(*, initial_delay_seconds: int | None = None):
+    """Register or remove the watches tick job so it matches the current config."""
+    if app.config.get("WATCHES_ENABLED"):
+        try:
+            tick_minutes = int(app.config.get("WATCHES_TICK_MINUTES", FALLBACK_CONFIG["WATCHES_TICK_MINUTES"]) or 0)
+        except (TypeError, ValueError):
+            tick_minutes = FALLBACK_CONFIG["WATCHES_TICK_MINUTES"]
+        tick_minutes = max(1, tick_minutes)
+        scheduler.add_job(
+            watch_runner.run_all_watches,
+            'interval',
+            minutes=tick_minutes,
+            id='watches_tick_job',
+            replace_existing=True,
+            misfire_grace_time=120,
+        )
+        if initial_delay_seconds is not None:
+            scheduler.add_job(
+                watch_runner.run_all_watches,
+                'date',
+                run_date=datetime.now() + timedelta(seconds=initial_delay_seconds),
+                id='initial_watches_tick_job',
+                replace_existing=True,
+            )
+        app.logger.info(f"Watches tick scheduled every {tick_minutes} min.")
+    else:
+        for job_id in ('watches_tick_job', 'initial_watches_tick_job'):
+            try:
+                scheduler.remove_job(job_id)
+            except Exception:
+                pass
+
+
 @app.before_serving
 async def startup():
     # 1. Load the configuration FIRST
@@ -777,7 +812,9 @@ async def startup():
         )
         scheduler.add_job(auto_buy_vip, 'date', run_date=datetime.now() + timedelta(seconds=10), id='initial_vip_buy_job')
         app.logger.info("AUTO_BUY_VIP started")
-    
+
+    sync_watches_scheduler_job(initial_delay_seconds=30)
+
     if not scheduler.running:
         scheduler.start()
         app.logger.debug("AsyncIOScheduler started")
@@ -824,7 +861,8 @@ async def shutdown():
         app.logger.info("Shared MAM proxy AsyncClient closed")
 
     await close_autosuggest_cache_db()
-    
+    watch_store.close()
+
     global monitor_task
     if monitor_task:
         monitor_task.cancel()
@@ -1047,6 +1085,9 @@ FALLBACK_CONFIG = {
     "THUMBNAIL_CACHE_MAX_SIZE_MB": 500,
     "MAX_SEARCH_RESULTS": 50,
     "MAX_AUTOCOMPLETE_RESULTS": 20,
+    "WATCHES_ENABLED": False,
+    "WATCHES_TICK_MINUTES": 5,
+    "WATCHES_PAUSE_SECONDS": 5,
     "HARDCOVER_ENRICHMENT_ENABLED": True,
     "HARDCOVER_API_TOKEN": "",
     "HARDCOVER_API_URL": "https://api.hardcover.app/v1/graphql",
@@ -1077,6 +1118,9 @@ VALID_VIP_DURATIONS = {"4", "8", "12", "max"}
 CONFIG_FILE = DATA_PATH / "config.json"
 DATABASE_FILE = DATA_PATH / "database.json"
 IP_STATE_FILE = DATA_PATH / "ip_state.json"
+WATCHES_DB_PATH = DATA_PATH / "watches.db"
+watch_store.configure(WATCHES_DB_PATH)
+app.register_blueprint(watches_bp)
 ENV_FILE = Path(".env")
 
 
@@ -1973,6 +2017,7 @@ def _normalize_webhook_query_value(value):
 def _build_auto_task_summary(context):
     label_map = {
         "task": "Task",
+        "watch": "Watch",
         "reason": "Reason",
         "amount": "Amount",
         "purchase_size": "Purchase Size",
@@ -1997,6 +2042,7 @@ def _build_auto_task_summary(context):
     }
     ordered_keys = [
         "task",
+        "watch",
         "reason",
         "amount",
         "purchase_size",
@@ -4083,29 +4129,20 @@ async def client_categories():
         categories = await torrent_client.get_categories()
     return jsonify(categories) if categories else (jsonify({'error': 'Failed'}), 500)
 
-@app.route('/client/add', methods=['POST'])
-async def client_add_torrent():
+async def add_torrent_to_client(incoming_data: dict, *, respect_buffer_block: bool = True) -> tuple[dict, int]:
     """
-    Handles the addition of a new torrent to the torrent client, with support for buffer checks, custom download paths, and auto-organization.
-    Workflow:
-    - Ensures the torrent client is initialized and logs in.
-    - Parses incoming JSON data for torrent details, including optional custom_relative_path.
-    - Checks if the user's buffer is sufficient to download the torrent; if not, returns a response with recommended upload credit.
-    - If a MID (metadata ID) is present and auto-organization is enabled, adds the torrent immediately and stores metadata for later hash resolution.
-    - If no MID or auto-organization is disabled, calculates the torrent hash and stores metadata for auto-organization.
-    - Adds the torrent to the client and, if successful, starts monitoring for completion if auto-organization is enabled.
-    Args:
-        None (expects JSON data in the request body with keys such as 'torrent_url', 'author', 'title', 'id', 'category', 'size', 'series_info', 'main_cat', 'download_link', and optionally 'custom_relative_path').
-    Returns:
-        Flask Response: JSON response indicating success, error, or insufficient buffer, with appropriate HTTP status codes.
-    """
+    Add a torrent to the configured client from a download payload (the shape
+    the UI posts to ``/client/add``) and return ``(payload, http_status)``.
 
+    Shared by the ``/client/add`` route and the watch runner. Handles the
+    buffer check, freeleech flags, fetching the ``.torrent`` bytes, storing
+    organize metadata and starting completion monitoring.
+    """
     if not torrent_client:
-        return jsonify({'error': 'Client not initialized'}), 500
-    
+        return {'error': 'Client not initialized'}, 500
+
     await torrent_client.login()
-    incoming_data = await request.get_json()
-    
+
     # --- NEW: Extract custom path ---
     custom_relative_path = incoming_data.get('custom_relative_path')
     custom_destination_path = incoming_data.get('custom_destination_path')
@@ -4179,7 +4216,7 @@ async def client_add_torrent():
         torrent_url = append_personal_freeleech_flag(torrent_url)
     
     # Check if download should be blocked due to low buffer
-    if app.config.get("BLOCK_DOWNLOAD_ON_LOW_BUFFER", True) and await login_mam():
+    if respect_buffer_block and app.config.get("BLOCK_DOWNLOAD_ON_LOW_BUFFER", True) and await login_mam():
         stats = await get_user_stats()
         if stats:
             torrent_size_gb = parse_size_to_gb(torrent_size_str)
@@ -4195,7 +4232,7 @@ async def client_add_torrent():
                     math.ceil(needed_gb)
                 )
                 
-                return jsonify({
+                return {
                     'status': 'insufficient_buffer',
                     'buffer_gb': round(buffer_gb, 2),
                     'torrent_size_gb': round(torrent_size_gb, 2),
@@ -4204,7 +4241,7 @@ async def client_add_torrent():
                     'recommended_cost': int(recommended_amount * cost_per_gb),
                     'seedbonus': stats['seedbonus'],
                     'message': f'Insufficient buffer: {round(buffer_gb, 2)} GB available, {round(torrent_size_gb, 2)} GB needed'
-                }), 400
+                }, 400
     
     auto_organize_warning = None
     hash_val = None
@@ -4215,7 +4252,7 @@ async def client_add_torrent():
     if client_type in supports_binary_add and torrent_url and torrent_url.lower().startswith(("http://", "https://")):
         torrent_file_data, torrent_filename = await fetch_torrent_file_from_mam(torrent_url)
         if torrent_file_data is None:
-            return jsonify({'error': f'Failed to download torrent file from MAM before sending to {client_type}'}), 400
+            return {'error': f'Failed to download torrent file from MAM before sending to {client_type}'}, 400
         client_add_kwargs = {
             "torrent_data": torrent_file_data,
             "torrent_filename": torrent_filename
@@ -4272,7 +4309,7 @@ async def client_add_torrent():
                 }
                 if auto_organize_warning:
                     response_data['warning'] = auto_organize_warning
-                return jsonify(response_data)
+                return response_data, 200
             
             # Store in pending_mid_resolutions for later hash resolution
             pending_mid_resolutions[id] = {
@@ -4282,12 +4319,12 @@ async def client_add_torrent():
             app.logger.info(f"Added MID {id} to pending_mid_resolutions for hash resolution")
             start_monitoring_loop()
             
-            return jsonify({
+            return {
                 'message': result['message'],
                 'personal_freeleech_applied': should_use_personal_freeleech,
-            })
+            }, 200
         else:
-            return jsonify({'error': result.get('message', 'Unknown error')}), 400
+            return {'error': result.get('message', 'Unknown error')}, 400
     
     # Fallback: No MID or auto-organize disabled - use old hash-based approach
     if not hash_val:
@@ -4340,9 +4377,85 @@ async def client_add_torrent():
         if resolved_hash:
             response_data['hash'] = resolved_hash
         if auto_organize_warning: response_data['warning'] = auto_organize_warning
-        return jsonify(response_data)
+        return response_data, 200
     else:
-        return jsonify({'error': result.get('message', 'Unknown error')}), 400
+        return {'error': result.get('message', 'Unknown error')}, 400
+
+
+
+def build_add_payload_from_result(
+    item: dict,
+    *,
+    category: str = "",
+    custom_relative_path: str | None = None,
+    custom_destination_path: str | None = None,
+) -> dict:
+    """Map a ``run_mam_search`` result to the payload ``add_torrent_to_client`` expects."""
+    payload = {
+        'torrent_url': item.get('download_link', ''),
+        'category': category or app.config.get("TORRENT_CLIENT_CATEGORY", ""),
+        'id': str(item.get('id', '0') or '0'),
+        'author': item.get('author_info') or "Unknown",
+        'title': item.get('title') or "Unknown",
+        'size': item.get('size') or '0 GiB',
+        'main_cat': str(item.get('main_cat', '') or ''),
+        'series_info': item.get('series_info', ''),
+        'catname': item.get('catname', '') or '',
+        'filetype': item.get('filetype') or item.get('filetypes') or '',
+        'free': item.get('free', 0) or 0,
+        'vip_freeleech': item.get('vip_freeleech', 0) or 0,
+        'personal_freeleech': item.get('personal_freeleech', 0) or 0,
+        'fl_vip': item.get('fl_vip', 0) or 0,
+        'use_personal_freeleech': False,
+    }
+    if custom_relative_path:
+        payload['custom_relative_path'] = custom_relative_path
+    if custom_destination_path:
+        payload['custom_destination_path'] = custom_destination_path
+    return payload
+
+
+async def add_torrent_from_result(
+    item: dict,
+    *,
+    category: str = "",
+    custom_relative_path: str | None = None,
+    custom_destination_path: str | None = None,
+    respect_buffer_block: bool = True,
+) -> dict:
+    """
+    Add a search result (as produced by ``run_mam_search``) to the torrent client.
+
+    Returns the same JSON-shaped dict the ``/client/add`` route returns:
+    ``{'message', 'hash'}`` on success, ``{'error'}`` on failure, or
+    ``{'status': 'insufficient_buffer', ...}`` when the buffer guard blocks it.
+    """
+    payload = build_add_payload_from_result(
+        item,
+        category=category,
+        custom_relative_path=custom_relative_path,
+        custom_destination_path=custom_destination_path,
+    )
+    result, _status = await add_torrent_to_client(payload, respect_buffer_block=respect_buffer_block)
+    return result
+
+
+@app.route('/client/add', methods=['POST'])
+async def client_add_torrent():
+    """
+    Handles the addition of a new torrent to the torrent client, with support for buffer checks, custom download paths, and auto-organization.
+    Thin wrapper around ``add_torrent_to_client``; see it for the workflow.
+    Args:
+        None (expects JSON data in the request body with keys such as 'torrent_url', 'author', 'title', 'id', 'category', 'size', 'series_info', 'main_cat', 'download_link', and optionally 'custom_relative_path').
+    Returns:
+        Flask Response: JSON response indicating success, error, or insufficient buffer, with appropriate HTTP status codes.
+    """
+    if not torrent_client:
+        return jsonify({'error': 'Client not initialized'}), 500
+
+    incoming_data = await request.get_json()
+    payload, status_code = await add_torrent_to_client(incoming_data or {})
+    return jsonify(payload), status_code
 
 @app.route('/client/resolve_mid', methods=['POST'])
 async def client_resolve_mid():
@@ -5236,87 +5349,101 @@ async def hardcover_update_user_book_status():
     })
 
 
-@app.route('/mam/search', methods=['GET'])
-async def mam_search():
-    if not await login_mam(): 
-        return await render_template(
-            "partials/results.html",
-            error_message="Login failed",
-            RESULTS_DISPLAY_FIELDS=app.config.get(
-                "RESULTS_DISPLAY_FIELDS",
-                FALLBACK_CONFIG["RESULTS_DISPLAY_FIELDS"]
-            ),
-        )
-    query = request.args.get("query", "").strip()
-    search_started_at = time.monotonic()
-    search_id = uuid.uuid4().hex[:12]
+SEARCH_FIELD_NAMES = [
+    "search_in_title",
+    "search_in_author",
+    "search_in_series",
+    "search_in_narrator",
+    "search_in_description",
+    "search_in_tags",
+    "search_in_filenames",
+]
+DEFAULT_SEARCH_FIELDS = {
+    "search_in_title": True,
+    "search_in_author": True,
+    "search_in_series": True,
+    "search_in_narrator": False,
+    "search_in_description": False,
+    "search_in_tags": False,
+    "search_in_filenames": False,
+}
+TRUTHY_CHECKBOX_VALUES = ("true", "on", "1", "yes")
 
-    # Used by templates to decide whether VIP Freeleech applies (fl_vip).
-    is_vip_active = False
-    try:
-        user_data = await fetch_mam_json_load()
-        vip_until = (user_data or {}).get('vip_until')
-        if vip_until:
-            vip_dt = datetime.fromisoformat(str(vip_until).strip().replace(' ', 'T'))
-            is_vip_active = vip_dt > datetime.utcnow()
-    except Exception:
-        is_vip_active = False
 
-    def get_nonempty_list(name):
-        return [v for v in request.args.getlist(name) if v]
+def _search_opt_list(opts: dict, name: str) -> list[str]:
+    """Return a non-empty list of string values for a (possibly multi-valued) option."""
+    value = opts.get(name)
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value if v not in (None, "")]
+    return [str(value)] if value not in (None, "") else []
 
-    search_field_names = [
-        "search_in_title",
-        "search_in_author",
-        "search_in_series",
-        "search_in_narrator",
-        "search_in_description",
-        "search_in_tags",
-        "search_in_filenames",
-    ]
-    has_search_param = any(request.args.get(name) is not None for name in search_field_names)
-    default_search_fields = {
-        "search_in_title": True,
-        "search_in_author": True,
-        "search_in_series": True,
-        "search_in_narrator": False,
-        "search_in_description": False,
-        "search_in_tags": False,
-        "search_in_filenames": False,
-    }
 
-    def checkbox_state(name):
-        val = request.args.get(name)
-        if val is None:
-            return default_search_fields.get(name, False) if not has_search_param else False
-        return val in ("true", "on", "1", "yes")
+def _search_opt_first(opts: dict, name: str, default=None):
+    """Mirror ``request.args.get``: first value if present, otherwise ``default``."""
+    value = opts.get(name)
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else default
+    return value
 
-    title_on = checkbox_state("search_in_title")
-    author_on = checkbox_state("search_in_author")
-    series_on = checkbox_state("search_in_series")
-    narrator_on = checkbox_state("search_in_narrator")
-    description_on = checkbox_state("search_in_description")
-    tags_on = checkbox_state("search_in_tags")
-    filenames_on = checkbox_state("search_in_filenames")
-    hide_downloaded = checkbox_state("hide_downloaded")
+
+def search_opt_checkbox(opts: dict, name: str) -> bool:
+    """
+    Resolve a checkbox-style option the same way the search route always has:
+    when no ``search_in_*`` option is present at all, fall back to the default
+    field set; once any is present, missing checkboxes mean unchecked.
+    """
+    has_search_param = any(opts.get(field) is not None for field in SEARCH_FIELD_NAMES)
+    value = _search_opt_first(opts, name)
+    if value is None:
+        return DEFAULT_SEARCH_FIELDS.get(name, False) if not has_search_param else False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in TRUTHY_CHECKBOX_VALUES
+
+
+def build_mam_search_params(opts: dict, *, perpage: int | None = None) -> dict:
+    """
+    Translate the search form / query-string options into MAM's
+    ``loadSearchJSONbasic.php`` parameters.
+
+    ``opts`` uses the same keys the UI sends (``query``, ``search_in_*``,
+    ``language_ids``, ``main_cat``, ``category_ids``, ``flag_ids``,
+    ``start_date``, ``min_seeders`` ...). Values may be scalars, booleans or
+    lists, so both ``request.args`` snapshots and stored watch definitions work.
+    """
+    query = str(_search_opt_first(opts, "query", "") or "").strip()
+
+    title_on = search_opt_checkbox(opts, "search_in_title")
+    author_on = search_opt_checkbox(opts, "search_in_author")
+    series_on = search_opt_checkbox(opts, "search_in_series")
+    narrator_on = search_opt_checkbox(opts, "search_in_narrator")
+    description_on = search_opt_checkbox(opts, "search_in_description")
+    tags_on = search_opt_checkbox(opts, "search_in_tags")
+    filenames_on = search_opt_checkbox(opts, "search_in_filenames")
     if author_on and not title_on:
         title_on = True
 
-    lang_ids = get_nonempty_list("language_ids") or get_nonempty_list("language_ids[]")
+    lang_ids = _search_opt_list(opts, "language_ids") or _search_opt_list(opts, "language_ids[]")
     if not lang_ids:
-        lang_value = request.args.get("language", "English")
+        lang_value = str(_search_opt_first(opts, "language", "English"))
         if lang_value.isdigit():
             lang_ids = [lang_value]
         else:
             lang_ids = [str(language_dict.get(lang_value, 1))]
 
     params = {
-        "tor[sortType]": "default",
-        "perpage": app.config.get("MAX_SEARCH_RESULTS", FALLBACK_CONFIG["MAX_SEARCH_RESULTS"]),
+        "tor[sortType]": _search_opt_first(opts, "sort_type", "default") or "default",
+        "perpage": perpage if perpage is not None else app.config.get(
+            "MAX_SEARCH_RESULTS", FALLBACK_CONFIG["MAX_SEARCH_RESULTS"]
+        ),
         "thumbnail": "true",
         "dlLink": "true",
         "tor[browse_lang][]": lang_ids,
-        "tor[searchType]": request.args.get("searchType", "all"),
+        "tor[searchType]": _search_opt_first(opts, "searchType", "all"),
         "isbn": "true", "description": "true", "mediaInfo": "true"
     }
     srch_in_fields = {
@@ -5336,34 +5463,34 @@ async def mam_search():
                 if quoted_variant:
                     search_text = f"({query} | \"{quoted_variant}\")"
         params["tor[text]"] = search_text
-    main_cats = [m for m in request.args.getlist("main_cat") if m]
+    main_cats = _search_opt_list(opts, "main_cat")
     if not main_cats:
-        main_cats = [m for m in request.args.getlist("media_type") if m]
+        main_cats = _search_opt_list(opts, "media_type")
     if main_cats and "all" not in main_cats:
         params["tor[main_cat][]"] = list(dict.fromkeys(main_cats))
 
-    if search_scope := request.args.get("search_scope"):
+    if search_scope := _search_opt_first(opts, "search_scope"):
         params["tor[searchIn]"] = search_scope
 
-    if category_ids := get_nonempty_list("category_ids") or get_nonempty_list("category_ids[]"):
+    if category_ids := _search_opt_list(opts, "category_ids") or _search_opt_list(opts, "category_ids[]"):
         params["tor[cat][]"] = category_ids
 
-    if flag_ids := get_nonempty_list("flag_ids") or get_nonempty_list("flag_ids[]"):
+    if flag_ids := _search_opt_list(opts, "flag_ids") or _search_opt_list(opts, "flag_ids[]"):
         params["tor[browseFlags][]"] = flag_ids
-        params["tor[browseFlagsHideVsShow]"] = request.args.get("flags_mode", "0")
+        params["tor[browseFlagsHideVsShow]"] = _search_opt_first(opts, "flags_mode", "0")
 
-    if start_date := request.args.get("start_date"):
+    if start_date := _search_opt_first(opts, "start_date"):
         params["tor[startDate]"] = start_date
-    if end_date := request.args.get("end_date"):
+    if end_date := _search_opt_first(opts, "end_date"):
         params["tor[endDate]"] = end_date
 
-    min_size = request.args.get("min_size")
-    max_size = request.args.get("max_size")
+    min_size = _search_opt_first(opts, "min_size")
+    max_size = _search_opt_first(opts, "max_size")
     if min_size:
         params["tor[minSize]"] = min_size
     if max_size:
         params["tor[maxSize]"] = max_size
-    if (min_size or max_size) and (size_unit := request.args.get("size_unit")):
+    if (min_size or max_size) and (size_unit := _search_opt_first(opts, "size_unit")):
         params["tor[unit]"] = size_unit
 
     stat_mappings = {
@@ -5375,73 +5502,128 @@ async def mam_search():
         "max_snatched": "tor[maxSnatched]"
     }
     for arg_name, tor_name in stat_mappings.items():
-        if value := request.args.get(arg_name):
+        if value := _search_opt_first(opts, arg_name):
             params[tor_name] = value
 
-    headers = {"Cookie": "; ".join([f"{k}={v}" for k, v in mam_session_cookies.items()])}
+    return params
+
+
+async def fetch_is_vip_active() -> bool:
+    """True when the MAM account currently has VIP (drives fl_vip handling)."""
     try:
-        response = await request_mam(
-            "GET",
-            f"{app.config['MAM_API_URL']}/tor/js/loadSearchJSONbasic.php",
-            params=params,
-            headers=headers,
+        user_data = await fetch_mam_json_load()
+        vip_until = (user_data or {}).get('vip_until')
+        if vip_until:
+            vip_dt = datetime.fromisoformat(str(vip_until).strip().replace(' ', 'T'))
+            return vip_dt > datetime.utcnow()
+    except Exception:
+        pass
+    return False
+
+
+async def run_mam_search(params: dict, *, is_vip_active: bool | None = None) -> list[dict]:
+    """
+    Execute a MAM search with pre-built ``params`` and return the ranked,
+    display-ready result list (download links, thumbnails, decoded metadata).
+
+    Shared by the ``/mam/search`` route and the watch runner. Raises on HTTP
+    or MAM errors; callers decide how to present them.
+    """
+    if is_vip_active is None:
+        is_vip_active = await fetch_is_vip_active()
+
+    headers = {"Cookie": "; ".join([f"{k}={v}" for k, v in mam_session_cookies.items()])}
+    response = await request_mam(
+        "GET",
+        f"{app.config['MAM_API_URL']}/tor/js/loadSearchJSONbasic.php",
+        params=params,
+        headers=headers,
+    )
+    response.raise_for_status()
+    json_data = response.json()
+    results = json_data.get("data", [])
+
+    # --- STEP 1: Rank Results FIRST ---
+    # We must rank BEFORE cleaning because rank_results expects raw JSON strings
+    ranked = rank_results(results)
+
+    base_dl_url = f"{app.config['MAM_API_URL']}/tor/download.php/"
+
+    # --- STEP 2: Clean Data for Display ---
+    # Now we decode HTML entities and fix formatting on the sorted list
+    for item in ranked:
+        # 1. Handle Download Links
+        # MAM rejects the link with "Invalid download link: missing tid"
+        # unless the torrent id is passed as a query param.
+        dl_hash = item.get('dl')
+        torrent_id = item.get('id')
+        item['download_link'] = build_mam_download_link(
+            base_dl_url,
+            dl_hash,
+            torrent_id,
         )
-        response.raise_for_status()
-        json_data = response.json()
-        results = json_data.get("data", [])
 
-        # --- STEP 1: Rank Results FIRST ---
-        # We must rank BEFORE cleaning because rank_results expects raw JSON strings
-        ranked = rank_results(results)
-
-        base_dl_url = f"{app.config['MAM_API_URL']}/tor/download.php/"
-
-        # --- STEP 2: Clean Data for Display ---
-        # Now we decode HTML entities and fix formatting on the sorted list
-        for item in ranked:
-            # 1. Handle Download Links
-            # MAM rejects the link with "Invalid download link: missing tid"
-            # unless the torrent id is passed as a query param.
-            dl_hash = item.get('dl')
-            torrent_id = item.get('id')
-            item['download_link'] = build_mam_download_link(
-                base_dl_url,
-                dl_hash,
-                torrent_id,
-            )
-
-            # 2. Handle Thumbnails
-            if not item.get('thumbnail'):
-                if item.get('id'):
-                    item['thumbnail'] = f"https://cdn.myanonamouse.net/t/p/small/{item['id']}.webp"
-                    item["has_mam_cover"] = True
-                else:
-                    cat = item.get('category', '')
-                    item['thumbnail'] = f"https://static.myanonamouse.net/pic/cats/3/{cat}.png"
-                    item["has_mam_cover"] = False
-            else:
+        # 2. Handle Thumbnails
+        if not item.get('thumbnail'):
+            if item.get('id'):
+                item['thumbnail'] = f"https://cdn.myanonamouse.net/t/p/small/{item['id']}.webp"
                 item["has_mam_cover"] = True
+            else:
+                cat = item.get('category', '')
+                item['thumbnail'] = f"https://static.myanonamouse.net/pic/cats/3/{cat}.png"
+                item["has_mam_cover"] = False
+        else:
+            item["has_mam_cover"] = True
 
-            # 3. Decode Metadata (Author, Narrator, Series)
-            # Note: rank_results may have already partially parsed these into strings.
-            # parse_mam_metadata handles both JSON strings AND plain strings safely.
-            item['author_info'] = parse_mam_metadata(item.get('author_info', ''))
-            item['narrator_info'] = parse_mam_metadata(item.get('narrator_info', ''))
+        # 3. Decode Metadata (Author, Narrator, Series)
+        # Note: rank_results may have already partially parsed these into strings.
+        # parse_mam_metadata handles both JSON strings AND plain strings safely.
+        item['author_info'] = parse_mam_metadata(item.get('author_info', ''))
+        item['narrator_info'] = parse_mam_metadata(item.get('narrator_info', ''))
 
-            # Overwrite series_display with our cleaner, HTML-decoded version
-            item['series_display'] = parse_mam_metadata(item.get('series_info', ''), is_series=True)
+        # Overwrite series_display with our cleaner, HTML-decoded version
+        item['series_display'] = parse_mam_metadata(item.get('series_info', ''), is_series=True)
 
-            # Carry the server-evaluated VIP entitlement into the download payload so
-            # the download route does not spend a wedge on VIP Freeleech torrents.
-            item['vip_freeleech'] = int(
-                coerce_bool(item.get('fl_vip'), False) and is_vip_active
-            )
+        # Carry the server-evaluated VIP entitlement into the download payload so
+        # the download route does not spend a wedge on VIP Freeleech torrents.
+        item['vip_freeleech'] = int(
+            coerce_bool(item.get('fl_vip'), False) and is_vip_active
+        )
 
-            language_id = str(item.get("language", "")).strip()
-            language_name = LANGUAGE_BY_ID.get(language_id)
-            if not language_name:
-                language_name = item.get("lang_code") or item.get("language") or "Unknown"
-            item["language_name"] = language_name
+        language_id = str(item.get("language", "")).strip()
+        language_name = LANGUAGE_BY_ID.get(language_id)
+        if not language_name:
+            language_name = item.get("lang_code") or item.get("language") or "Unknown"
+        item["language_name"] = language_name
+
+    return ranked
+
+
+@app.route('/mam/search', methods=['GET'])
+async def mam_search():
+    if not await login_mam(): 
+        return await render_template(
+            "partials/results.html",
+            error_message="Login failed",
+            RESULTS_DISPLAY_FIELDS=app.config.get(
+                "RESULTS_DISPLAY_FIELDS",
+                FALLBACK_CONFIG["RESULTS_DISPLAY_FIELDS"]
+            ),
+        )
+    # Snapshot the query string into a plain dict so the same builder can be
+    # driven by saved searches (watches) without a request context.
+    opts = {key: request.args.getlist(key) for key in request.args}
+    query = _search_opt_first(opts, "query", "").strip()
+    search_started_at = time.monotonic()
+    search_id = uuid.uuid4().hex[:12]
+
+    # Used by templates to decide whether VIP Freeleech applies (fl_vip).
+    is_vip_active = await fetch_is_vip_active()
+    hide_downloaded = search_opt_checkbox(opts, "hide_downloaded")
+    params = build_mam_search_params(opts)
+
+    try:
+        ranked = await run_mam_search(params, is_vip_active=is_vip_active)
 
         # ... Rest of your function ...
         client_status_data = await torrent_client.get_status() if torrent_client else {"status": "error"}
@@ -5880,6 +6062,7 @@ async def update_settings():
         "BLOCK_DOWNLOAD_ON_LOW_BUFFER",
         "AUTO_BUY_PERSONAL_FL_ON_DOWNLOAD",
         "AUTO_BUY_PERSONAL_FL_ON_DOWNLOAD_MIN_SIZE_ENABLED",
+        "WATCHES_ENABLED",
     }
     for key in FALLBACK_CONFIG.keys():
         if key in boolean_fields: config_to_update[key] = key in form
@@ -6023,6 +6206,8 @@ async def update_settings():
             app.logger.info("Auto-organize safety net disabled.")
         except:
             pass
+
+    sync_watches_scheduler_job()
 
     # Get the new display name from the source of truth
     new_type = config_to_update.get("TORRENT_CLIENT_TYPE")
@@ -6429,6 +6614,19 @@ async def check_for_unorganized_torrents():
                 failed_count=failed,
                 error=last_error,
             )
+
+
+# --- Watches: hand the shared search/add helpers to the runner ---
+watch_runner.configure(
+    build_params=build_mam_search_params,
+    search=run_mam_search,
+    add=add_torrent_from_result,
+    login=login_mam,
+    notify=send_auto_task_webhook_notification,
+    toast=broadcast_toast,
+    logger=app.logger,
+    config=lambda key, default=None: app.config.get(key, default),
+)
 
 
 if __name__ == "__main__":
